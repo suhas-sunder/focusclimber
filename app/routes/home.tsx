@@ -253,7 +253,7 @@ export default function Home({ loaderData: { nowISO } }: Route.ComponentProps) {
         className="mx-auto mt-10 max-w-3xl rounded-2xl border border-emerald-200 bg-emerald-50/60 p-6 text-left leading-relaxed text-emerald-900"
       >
         <h2 className="mb-3 text-2xl font-bold text-emerald-800">
-          How to Use FocusClimber
+          How to Use Focus Climber
         </h2>
         <p className="mb-4 text-emerald-800">
           FocusClimber helps you stay productive through structured Pomodoro

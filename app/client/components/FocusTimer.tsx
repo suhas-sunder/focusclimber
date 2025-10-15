@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const MODES = {
-  pomodoro: { label: "Pomodoro", minutes: 25 },
+  pomodoro: { label: "Pomodoro", minutes: 1 }, // set to 25 for production
   short: { label: "Short Break", minutes: 5 },
   long: { label: "Long Break", minutes: 15 },
-};
+} as const;
 
 type Task = {
   id: number;
@@ -19,20 +19,37 @@ type Task = {
 
 export default function FocusTimer() {
   const [mode, setMode] = useState<keyof typeof MODES>("pomodoro");
-  const [minutes, setMinutes] = useState(MODES.pomodoro.minutes);
-  const [seconds, setSeconds] = useState(0);
+
+  // --- Single source of truth for time left (in seconds) ---
+  const [remaining, setRemaining] = useState(MODES.pomodoro.minutes * 60);
   const [isRunning, setIsRunning] = useState(false);
+
   const [tasks, setTasks] = useState<Task[]>([]);
   const [completedTasks, setCompletedTasks] = useState<Task[]>([]);
   const [activeTask, setActiveTask] = useState<number | null>(null);
+
   const [newTask, setNewTask] = useState("");
   const [estPomos, setEstPomos] = useState(1);
   const [projectInput, setProjectInput] = useState("");
   const [projectTags, setProjectTags] = useState<string[]>([]);
   const [note, setNote] = useState("");
-  const [completedPomodoros, setCompletedPomodoros] = useState(0);
+
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+
+  // ETA end time (null when paused/reset)
+  const [endTime, setEndTime] = useState<number | null>(null);
+
+  // Prevent duplicate completion calls
+  const completionGuardRef = useRef(false);
+
+  // Per-task edit input for adding project tags while editing
+  const [editProjectInput, setEditProjectInput] = useState<
+    Record<number, string>
+  >({});
+
+  // Completed task detail modal
+  const [completedDetail, setCompletedDetail] = useState<Task | null>(null);
 
   // === Load saved data ===
   useEffect(() => {
@@ -41,8 +58,11 @@ export default function FocusTimer() {
     const savedMode = localStorage.getItem("focusclimber_mode_v7");
     if (savedTasks) setTasks(JSON.parse(savedTasks));
     if (doneTasks) setCompletedTasks(JSON.parse(doneTasks));
-    if (savedMode && MODES[savedMode as keyof typeof MODES])
-      setMode(savedMode as keyof typeof MODES);
+    if (savedMode && MODES[savedMode as keyof typeof MODES]) {
+      const m = savedMode as keyof typeof MODES;
+      setMode(m);
+      setRemaining(MODES[m].minutes * 60);
+    }
   }, []);
 
   // === Persist changes ===
@@ -55,60 +75,137 @@ export default function FocusTimer() {
     localStorage.setItem("focusclimber_mode_v7", mode);
   }, [tasks, completedTasks, mode]);
 
-  // === Timer logic ===
+  // === Reset on mode change ===
   useEffect(() => {
-    setMinutes(MODES[mode].minutes);
-    setSeconds(0);
+    setIsRunning(false);
+    setEndTime(null);
+    completionGuardRef.current = false;
+    setRemaining(MODES[mode].minutes * 60);
   }, [mode]);
 
+  // === Timer logic (driven only by isRunning) ===
   useEffect(() => {
     if (!isRunning) return;
+
     const timer = setInterval(() => {
-      if (seconds > 0) setSeconds((s) => s - 1);
-      else if (minutes > 0) {
-        setMinutes((m) => m - 1);
-        setSeconds(59);
-      } else handleComplete();
+      setRemaining((prev) => {
+        if (prev > 1) return prev - 1;
+        // prev is 1 or 0 -> on next tick, complete
+        if (!completionGuardRef.current) {
+          completionGuardRef.current = true;
+          handleComplete();
+        }
+        return 0;
+      });
     }, 1000);
+
     return () => clearInterval(timer);
-  }, [isRunning, minutes, seconds, mode]);
+  }, [isRunning]);
+
+  // === Completion beep (system-safe WebAudio) ===
+  const beep = () => {
+    try {
+      const AudioCtx =
+        window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new AudioCtx();
+
+      // ensure context is resumed (user gesture unlock)
+      if (ctx.state === "suspended") ctx.resume();
+
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = "sine";
+      osc.frequency.value = 880; // mid-high pitch
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
+      const now = ctx.currentTime;
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.2, now + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
+
+      osc.start(now);
+      osc.stop(now + 0.3);
+    } catch (e) {
+      console.warn("Beep error:", e);
+    }
+  };
 
   const handleComplete = () => {
     setIsRunning(false);
-    try {
-      new Audio("/chime.mp3").play();
-    } catch {}
+    setEndTime(null);
+    beep();
 
     // Only count progress for Pomodoro sessions
-    if (mode !== "pomodoro") return;
+    if (mode !== "pomodoro") {
+      resetTimerAfterCompletion();
+      return;
+    }
 
-    setCompletedPomodoros((n) => n + 1);
-
+    // Increment pomodoro for current (top) task, possibly complete it
     setTasks((prev) => {
-      if (prev.length === 0) return prev;
+      if (prev.length === 0) {
+        resetTimerAfterCompletion();
+        return prev;
+      }
+
       const currentId = activeTask ?? prev[0].id;
       const updated = prev.map((t) =>
         t.id === currentId ? { ...t, donePomos: t.donePomos + 1 } : t
       );
 
-      // Find the updated task
       const current = updated.find((t) => t.id === currentId);
       if (current && current.donePomos >= current.est) {
-        // Move to completed list
         const finished = { ...current, completed: true };
-        setCompletedTasks((prevDone) => [finished, ...prevDone]);
-        return updated.filter((t) => t.id !== currentId);
+        setCompletedTasks((prevDone) => {
+          if (prevDone.some((d) => d.id === finished.id)) return prevDone;
+          return [finished, ...prevDone];
+        });
+        const nextList = updated.filter((t) => t.id !== currentId);
+        setActiveTask(nextList[0]?.id ?? null);
+        resetTimerAfterCompletion();
+        return nextList;
       }
 
+      resetTimerAfterCompletion();
       return updated;
     });
   };
 
-  const toggleTimer = () => setIsRunning(!isRunning);
+  const resetTimerAfterCompletion = () => {
+    completionGuardRef.current = false;
+    setIsRunning(false);
+    setEndTime(null);
+    setRemaining(MODES[mode].minutes * 60);
+  };
+
+  const toggleTimer = () => {
+    if (!isRunning) {
+      // If already at 0, refill to full length before starting
+      if (remaining <= 0) {
+        const refill = MODES[mode].minutes * 60;
+        setRemaining(refill);
+        setEndTime(Date.now() + refill * 1000);
+        completionGuardRef.current = false;
+        setIsRunning(true);
+        return;
+      }
+      setEndTime(Date.now() + remaining * 1000);
+      completionGuardRef.current = false;
+      setIsRunning(true);
+    } else {
+      // pause
+      setIsRunning(false);
+      setEndTime(null);
+    }
+  };
+
   const resetTimer = () => {
     setIsRunning(false);
-    setMinutes(MODES[mode].minutes);
-    setSeconds(0);
+    setEndTime(null);
+    completionGuardRef.current = false;
+    setRemaining(MODES[mode].minutes * 60);
   };
 
   // === Fullscreen ===
@@ -139,24 +236,33 @@ export default function FocusTimer() {
       projects: projectTags,
       notes: note,
     };
-    setTasks([...tasks, task]);
+    const next = [...tasks, task];
+    setTasks(next);
     setNewTask("");
     setEstPomos(1);
     setProjectTags([]);
     setNote("");
+    if (!activeTask) setActiveTask(task.id);
   };
 
   const completeTask = (id: number, list: Task[] = tasks) => {
     const t = list.find((x) => x.id === id);
-    if (t) {
-      const updated = { ...t, completed: true };
-      setCompletedTasks([updated, ...completedTasks]);
-      setTasks(list.filter((x) => x.id !== id));
-      if (activeTask === id) setActiveTask(null);
-    }
+    if (!t) return;
+    const finished = { ...t, completed: true };
+    setCompletedTasks((prevDone) => {
+      if (prevDone.some((d) => d.id === finished.id)) return prevDone;
+      return [finished, ...prevDone];
+    });
+    const next = list.filter((x) => x.id !== id);
+    setTasks(next);
+    if (activeTask === id) setActiveTask(next[0]?.id ?? null);
   };
 
-  const deleteTask = (id: number) => setTasks(tasks.filter((t) => t.id !== id));
+  const deleteTask = (id: number) => {
+    const next = tasks.filter((t) => t.id !== id);
+    setTasks(next);
+    if (activeTask === id) setActiveTask(next[0]?.id ?? null);
+  };
 
   const updateTaskField = (id: number, field: keyof Task, value: any) =>
     setTasks((prev) =>
@@ -185,31 +291,64 @@ export default function FocusTimer() {
     } else if (tasks.length === 0) {
       setActiveTask(null);
     }
-  }, [tasks]);
+  }, [tasks]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // === Project Tags ===
+  // === Project Tags (task-creation form) ===
   const addProjectTag = () => {
-    if (projectInput.trim() && !projectTags.includes(projectInput.trim())) {
-      setProjectTags([...projectTags, projectInput.trim()]);
+    const v = projectInput.trim();
+    if (v && !projectTags.includes(v)) {
+      setProjectTags((tags) => [...tags, v]);
       setProjectInput("");
     }
   };
-
   const removeProjectTag = (p: string) =>
-    setProjectTags(projectTags.filter((tag) => tag !== p));
+    setProjectTags((tags) => tags.filter((tag) => tag !== p));
 
-  // === UI helpers ===
+  // === UI helpers (derived from remaining) ===
+  const minutes = Math.floor(remaining / 60);
+  const seconds = remaining % 60;
   const formatted = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+
   const totalSeconds = MODES[mode].minutes * 60;
-  const elapsed = totalSeconds - (minutes * 60 + seconds);
-  const progress = (elapsed / totalSeconds) * 100;
+  const progress = Math.max(
+    0,
+    Math.min(100, ((totalSeconds - remaining) / totalSeconds) * 100)
+  );
+
+  // stable finish time from locked endTime
   const finishTime = useMemo(() => {
-    const end = new Date(Date.now() + (minutes * 60 + seconds) * 1000);
+    if (!endTime) return "—";
+    const end = new Date(endTime);
     return end.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  }, [minutes, seconds]);
+  }, [endTime]);
+
+  // Render helpers for editing projects within a task
+  const addEditProjectTag = (taskId: number) => {
+    const value = (editProjectInput[taskId] || "").trim();
+    if (!value) return;
+    setTasks((prev) =>
+      prev.map((t) =>
+        t.id === taskId && !t.projects.includes(value)
+          ? { ...t, projects: [...t.projects, value] }
+          : t
+      )
+    );
+    setEditProjectInput((m) => ({ ...m, [taskId]: "" }));
+  };
+  const removeEditProjectTag = (taskId: number, tag: string) => {
+    setTasks((prev) =>
+      prev.map((t) =>
+        t.id === taskId
+          ? { ...t, projects: t.projects.filter((p) => p !== tag) }
+          : t
+      )
+    );
+  };
+
+  const activeObj = tasks.find((t) => t.id === activeTask);
 
   return (
-    <div className="mx-auto mt-10 w-full max-w-lg rounded-2xl border border-emerald-200 bg-white/90 p-6 text-center shadow-sm relative">
+    <div className="relative mx-auto mt-10 w-full max-w-lg rounded-2xl border border-emerald-200 bg-white/90 p-6 text-center shadow-sm">
       <style>
         {`
         @import url('https://fonts.googleapis.com/css2?family=Rubik:wght@500;700&display=swap');
@@ -220,14 +359,14 @@ export default function FocusTimer() {
       {/* Fullscreen */}
       <button
         onClick={toggleFullscreen}
-        title="Toggle Fullscreen (F)"
+        title="Toggle Fullscreen"
         className="absolute right-4 top-4 rounded-md border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-100"
       >
         {isFullscreen ? "Exit Fullscreen" : "Fullscreen"}
       </button>
 
-      {/* Mode Tabs */}
-      <div className="mb-4 flex justify-center gap-2 mt-6">
+      {/* Mode Tabs (manual; no auto-switching) */}
+      <div className="mb-4 mt-6 flex justify-center gap-2">
         {Object.entries(MODES).map(([key, val]) => (
           <button
             key={key}
@@ -243,17 +382,18 @@ export default function FocusTimer() {
         ))}
       </div>
 
-      {/* Timer */}
-      <div className="mb-6 select-none font-bold text-emerald-900 md:text-8xl text-7xl rounded-font tracking-widest">
-  <span
-    className="inline-block min-w-[10ch] text-center font-mono tabular-nums"
-    style={{ letterSpacing: "0.05em" }}
-  >
-    {formatted}
-  </span>
-</div>
+      {/* Timer (static width; tabular nums) */}
+      <div className="mb-6 select-none rounded-font font-bold tracking-widest text-emerald-900 md:text-8xl text-7xl">
+        <span
+          className="inline-block min-w-[10ch] text-center font-mono tabular-nums"
+          style={{ letterSpacing: "0.05em" }}
+        >
+          {formatted}
+        </span>
+      </div>
 
-      <div className="h-3 w-full rounded-full bg-emerald-100 mb-4 overflow-hidden">
+      {/* Progress bar */}
+      <div className="mb-4 h-3 w-full overflow-hidden rounded-full bg-emerald-100">
         <div
           className="h-full bg-emerald-500 transition-all"
           style={{ width: `${progress}%` }}
@@ -261,41 +401,38 @@ export default function FocusTimer() {
       </div>
 
       {/* Controls */}
-      <div className="flex justify-center gap-3 mb-6">
+      <div className="mb-6 flex justify-center gap-3">
         <button
           onClick={toggleTimer}
-          className="rounded-xl bg-emerald-600 px-6 py-3 text-lg text-white hover:bg-emerald-700 transition"
+          className="rounded-xl bg-emerald-600 px-6 py-3 text-lg text-white transition hover:bg-emerald-700"
         >
           {isRunning ? "Pause" : "Start"}
         </button>
         <button
           onClick={resetTimer}
-          className="rounded-xl border border-emerald-400 px-6 py-3 text-lg text-emerald-800 hover:bg-emerald-50 transition"
+          className="rounded-xl border border-emerald-400 px-6 py-3 text-lg text-emerald-800 transition hover:bg-emerald-50"
         >
           Reset
         </button>
       </div>
 
       {/* Active Task */}
-      {tasks.length > 0 && (
+      {activeObj && (
         <div className="mb-5 text-emerald-700">
-          <p className="font-semibold">
-            {tasks.find((t) => t.id === activeTask)?.text}
-          </p>
+          <p className="font-semibold">{activeObj.text}</p>
           <p className="text-xs italic">
-            {tasks.find((t) => t.id === activeTask)?.donePomos}/
-            {tasks.find((t) => t.id === activeTask)?.est} Pomos • Finish ~{" "}
-            {finishTime}
+            {activeObj.donePomos}/{activeObj.est} Pomos
+            {finishTime !== "—" && <> • Finish ~ {finishTime}</>}
           </p>
         </div>
       )}
 
       {/* Task List */}
-      <div className="text-left border-t border-emerald-100 pt-4 mb-6">
-        <h4 className="font-semibold text-emerald-900 mb-3">
+      <div className="mb-6 text-left border-t border-emerald-100 pt-4">
+        <h4 className="mb-3 font-semibold text-emerald-900">
           Tasks (drag to reorder)
         </h4>
-        <ul className="space-y-2 mb-4">
+        <ul className="mb-4 space-y-2">
           {tasks.map((t, i) => (
             <li
               key={t.id}
@@ -312,31 +449,145 @@ export default function FocusTimer() {
                   : "border-emerald-100 bg-white hover:bg-emerald-50"
               }`}
             >
-              <div className="flex items-center justify-between">
-                <div className="flex-grow">
-                  <div className="font-medium text-emerald-800">{t.text}</div>
-                  <div className="text-xs text-emerald-600">
-                    {t.donePomos}/{t.est} Pomos{" "}
-                    {t.projects.length > 0 && (
-                      <span className="ml-1">• {t.projects.join(", ")}</span>
-                    )}
+              {t.editing ? (
+                <div className="space-y-2">
+                  {/* Text */}
+                  <input
+                    type="text"
+                    value={t.text}
+                    onChange={(e) =>
+                      updateTaskField(t.id, "text", e.target.value)
+                    }
+                    className="w-full rounded-md border border-emerald-200 px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400"
+                  />
+                  {/* Notes */}
+                  <textarea
+                    value={t.notes || ""}
+                    onChange={(e) =>
+                      updateTaskField(t.id, "notes", e.target.value)
+                    }
+                    placeholder="Notes..."
+                    className="w-full rounded-md border border-emerald-200 px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400"
+                  />
+                  {/* Est Pomos */}
+                  <div className="flex items-center gap-2">
+                    <label className="text-xs text-emerald-700">
+                      Est Pomos:
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={50}
+                      value={t.est}
+                      onChange={(e) =>
+                        updateTaskField(
+                          t.id,
+                          "est",
+                          parseInt(e.target.value) || 1
+                        )
+                      }
+                      className="w-20 rounded border border-emerald-300 px-2 py-1 text-sm"
+                    />
+                  </div>
+                  {/* Project tags editor */}
+                  <div>
+                    <div className="mb-2 flex gap-2">
+                      <input
+                        type="text"
+                        placeholder="+ Add Project"
+                        value={editProjectInput[t.id] || ""}
+                        onChange={(e) =>
+                          setEditProjectInput((m) => ({
+                            ...m,
+                            [t.id]: e.target.value,
+                          }))
+                        }
+                        onKeyDown={(e) =>
+                          e.key === "Enter" && addEditProjectTag(t.id)
+                        }
+                        className="flex-grow rounded-md border border-emerald-200 px-2 py-1 text-sm"
+                      />
+                      <button
+                        onClick={() => addEditProjectTag(t.id)}
+                        className="rounded-md bg-emerald-600 px-3 py-1 text-sm text-white hover:bg-emerald-700"
+                      >
+                        Add
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {t.projects.map((p) => (
+                        <span
+                          key={p}
+                          className="rounded-full bg-emerald-100 px-3 py-1 text-xs text-emerald-800"
+                        >
+                          {p}{" "}
+                          <button
+                            onClick={() => removeEditProjectTag(t.id, p)}
+                            className="ml-1 text-emerald-600 hover:text-emerald-900"
+                          >
+                            ×
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <button
+                      onClick={() => updateTaskField(t.id, "editing", false)}
+                      className="rounded-md bg-emerald-600 px-3 py-1 text-sm text-white hover:bg-emerald-700"
+                    >
+                      Save
+                    </button>
+                    <button
+                      onClick={() => updateTaskField(t.id, "editing", false)}
+                      className="rounded-md border border-emerald-300 px-3 py-1 text-sm text-emerald-800 hover:bg-emerald-50"
+                    >
+                      Cancel
+                    </button>
                   </div>
                 </div>
-                <div className="flex gap-2 ml-2">
-                  <button
-                    onClick={() => completeTask(t.id)}
-                    className="text-emerald-600 hover:text-emerald-900"
-                  >
-                    ✓
-                  </button>
-                  <button
-                    onClick={() => deleteTask(t.id)}
-                    className="text-emerald-600 hover:text-emerald-900"
-                  >
-                    ✕
-                  </button>
+              ) : (
+                <div className="flex items-center justify-between">
+                  <div className="flex-grow">
+                    <div
+                      className="cursor-pointer font-medium text-emerald-800"
+                      onClick={() => setActiveTask(t.id)}
+                      title="Set active"
+                    >
+                      {t.text}
+                    </div>
+                    <div className="text-xs text-emerald-600">
+                      {t.donePomos}/{t.est} Pomos{" "}
+                      {t.projects.length > 0 && (
+                        <span className="ml-1">• {t.projects.join(", ")}</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="ml-2 flex gap-2">
+                    <button
+                      onClick={() => updateTaskField(t.id, "editing", true)}
+                      className="text-emerald-600 hover:text-emerald-900"
+                      title="Edit"
+                    >
+                      ✎
+                    </button>
+                    <button
+                      onClick={() => completeTask(t.id)}
+                      className="text-emerald-600 hover:text-emerald-900"
+                      title="Mark complete"
+                    >
+                      ✓
+                    </button>
+                    <button
+                      onClick={() => deleteTask(t.id)}
+                      className="text-emerald-600 hover:text-emerald-900"
+                      title="Delete"
+                    >
+                      ✕
+                    </button>
+                  </div>
                 </div>
-              </div>
+              )}
             </li>
           ))}
         </ul>
@@ -348,23 +599,23 @@ export default function FocusTimer() {
             placeholder="What are you working on?"
             value={newTask}
             onChange={(e) => setNewTask(e.target.value)}
-            className="w-full rounded-md border border-emerald-200 px-2 py-1 mb-2 focus:ring-2 focus:ring-emerald-400 focus:outline-none"
+            className="mb-2 w-full rounded-md border border-emerald-200 px-2 py-1 focus:outline-none focus:ring-2 focus:ring-emerald-400"
           />
-          <div className="flex items-center gap-2 mb-2">
+          <div className="mb-2 flex items-center gap-2">
             <label className="text-xs text-emerald-700">Est Pomodoros:</label>
             <input
               type="number"
               min={1}
-              max={10}
+              max={50}
               value={estPomos}
               onChange={(e) => setEstPomos(parseInt(e.target.value) || 1)}
-              className="w-16 rounded border border-emerald-300 px-1 py-0.5 text-center text-sm"
+              className="w-20 rounded border border-emerald-300 px-2 py-1 text-sm"
             />
           </div>
 
           {/* Projects */}
           <div className="mb-2">
-            <div className="flex gap-2 mb-2">
+            <div className="mb-2 flex gap-2">
               <input
                 type="text"
                 placeholder="+ Add Project"
@@ -375,7 +626,7 @@ export default function FocusTimer() {
               />
               <button
                 onClick={addProjectTag}
-                className="rounded-md bg-emerald-600 px-3 py-1 text-white hover:bg-emerald-700 text-sm"
+                className="rounded-md bg-emerald-600 px-3 py-1 text-sm text-white hover:bg-emerald-700"
               >
                 Add
               </button>
@@ -402,7 +653,7 @@ export default function FocusTimer() {
             placeholder="+ Add Note"
             value={note}
             onChange={(e) => setNote(e.target.value)}
-            className="w-full rounded-md border border-emerald-200 px-2 py-1 mb-2 text-sm focus:ring-2 focus:ring-emerald-400 focus:outline-none"
+            className="mb-2 w-full rounded-md border border-emerald-200 px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400"
           />
           <div className="flex justify-end">
             <button
@@ -418,22 +669,64 @@ export default function FocusTimer() {
       {/* Completed Tasks */}
       {completedTasks.length > 0 && (
         <div className="border-t border-emerald-100 pt-4 text-left">
-          <h4 className="font-semibold text-emerald-900 mb-2">
+          <h4 className="mb-2 font-semibold text-emerald-900">
             Completed Today
           </h4>
           <ul className="space-y-2 text-sm text-emerald-700">
             {completedTasks.map((t) => (
               <li
                 key={t.id}
-                className="flex justify-between rounded-md bg-emerald-50 px-3 py-2"
+                className="flex cursor-pointer items-center justify-between rounded-md bg-emerald-50 px-3 py-2 hover:bg-emerald-100"
+                onClick={() => setCompletedDetail(t)}
+                title="View details"
               >
                 <span>{t.text}</span>
                 <span className="text-xs text-emerald-600">
-                  {t.est} Pomos • {t.projects.join(", ")}
+                  {t.est} Pomos
+                  {t.projects.length > 0 && ` • ${t.projects.join(", ")}`}
                 </span>
               </li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {/* Completed Task Modal */}
+      {completedDetail && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4"
+          onClick={() => setCompletedDetail(null)}
+        >
+          <div
+            className="w-full max-w-md rounded-2xl border border-emerald-200 bg-white p-5 shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="mb-2 text-lg font-semibold text-emerald-900">
+              {completedDetail.text}
+            </h3>
+            <div className="mb-2 text-sm text-emerald-700">
+              <strong>Pomodoros:</strong> {completedDetail.donePomos}/
+              {completedDetail.est}
+            </div>
+            {completedDetail.projects?.length > 0 && (
+              <div className="mb-2 text-sm text-emerald-700">
+                <strong>Projects:</strong> {completedDetail.projects.join(", ")}
+              </div>
+            )}
+            {completedDetail.notes && (
+              <div className="mb-4 whitespace-pre-wrap text-sm text-emerald-700">
+                <strong>Notes:</strong> {completedDetail.notes}
+              </div>
+            )}
+            <div className="flex justify-end">
+              <button
+                onClick={() => setCompletedDetail(null)}
+                className="rounded-md bg-emerald-600 px-4 py-2 text-sm text-white hover:bg-emerald-700"
+              >
+                Close
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
