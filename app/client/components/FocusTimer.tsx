@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const MODES = {
-  pomodoro: { label: "Pomodoro", minutes: 1 }, // set to 25 for production
+  pomodoro: { label: "Pomodoro", minutes: 25 }, // set to 25 for production
   short: { label: "Short Break", minutes: 5 },
   long: { label: "Long Break", minutes: 15 },
 } as const;
@@ -14,6 +14,7 @@ type Task = {
   projects: string[];
   notes?: string;
   completed?: boolean;
+  completedAt?: number;
   editing?: boolean;
 };
 
@@ -62,6 +63,26 @@ export default function FocusTimer() {
       const m = savedMode as keyof typeof MODES;
       setMode(m);
       setRemaining(MODES[m].minutes * 60);
+    }
+  }, []);
+
+  useEffect(() => {
+    // auto-clear completed tasks older than 1 day (same calendar date)
+    const now = new Date();
+    const todayKey = now.toISOString().slice(0, 10); // "YYYY-MM-DD"
+
+    const lastClear = localStorage.getItem("focusclimber_lastClear_v1");
+    if (lastClear !== todayKey) {
+      setCompletedTasks((prev) => {
+        const filtered = prev.filter((t) => {
+          if (!t.completedAt) return false;
+          const d = new Date(t.completedAt);
+          const dayKey = d.toISOString().slice(0, 10);
+          return dayKey === todayKey;
+        });
+        return filtered;
+      });
+      localStorage.setItem("focusclimber_lastClear_v1", todayKey);
     }
   }, []);
 
@@ -157,7 +178,12 @@ export default function FocusTimer() {
 
       const current = updated.find((t) => t.id === currentId);
       if (current && current.donePomos >= current.est) {
-        const finished = { ...current, completed: true };
+        const finished = {
+          ...current,
+          completed: true,
+          completedAt: Date.now(),
+        };
+
         setCompletedTasks((prevDone) => {
           if (prevDone.some((d) => d.id === finished.id)) return prevDone;
           return [finished, ...prevDone];
@@ -248,7 +274,7 @@ export default function FocusTimer() {
   const completeTask = (id: number, list: Task[] = tasks) => {
     const t = list.find((x) => x.id === id);
     if (!t) return;
-    const finished = { ...t, completed: true };
+    const finished = { ...t, completed: true, completedAt: Date.now() };
     setCompletedTasks((prevDone) => {
       if (prevDone.some((d) => d.id === finished.id)) return prevDone;
       return [finished, ...prevDone];
